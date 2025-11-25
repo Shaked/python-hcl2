@@ -363,6 +363,18 @@ class HCLReverseTransformer:
         return Tree(Token("RULE", "identifier"), [Token("NAME", name)])
 
     @staticmethod
+    def _is_valid_identifier(name: str) -> bool:
+        """Check if a string is a valid HCL identifier.
+
+        Valid identifiers match the pattern: [a-zA-Z_][a-zA-Z0-9_-]*
+        """
+        if not name:
+            return False
+        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]*$", name):
+            return False
+        return True
+
+    @staticmethod
     def _escape_interpolated_str(interp_s: str) -> str:
         if interp_s.strip().startswith("<<-") or interp_s.strip().startswith("<<"):
             # For heredoc strings, preserve their format exactly
@@ -620,15 +632,115 @@ class HCLReverseTransformer:
                     continue
 
                 value_expr_term = self._transform_value_to_expr_term(dict_v, level + 1)
+                original_k = k
                 k = self._unwrap_interpolation(k)
+
+                # Determine the type of key:
+                # 1. Valid identifier (e.g., "foo") -> use as identifier
+                # 2. Unwrapped interpolation that's an expression (e.g., "${(var.x)}" -> "(var.x)") -> parse as expression
+                # 3. Quoted string (e.g., '"foo"' or '"foo_${var.x}"') -> parse as string expression
+                # 4. String with special characters (e.g., "foo/bar") -> quote as string
+                if self._is_valid_identifier(k):
+                    # Simple identifier
+                    object_key = Tree(
+                        Token("RULE", "object_elem_key"),
+                        [Tree(Token("RULE", "identifier"), [Token("NAME", k)])],
+                    )
+                elif self._is_string_wrapped_tf(original_k):
+                    # This was wrapped in ${ }, so it's an expression
+                    # Parse it and create an object_elem_key_expression
+                    try:
+                        ast = reconstruction_parser().parse(f"value = {k}")
+                        attribute = ast.children[0].children[0]
+                        parsed_expr = attribute.children[2]
+
+                        # Check if parsed_expr is an expr_term with parentheses
+                        # Structure: expr_term -> ( expr_term )
+                        if (
+                            isinstance(parsed_expr, Tree)
+                            and parsed_expr.data == "expr_term"
+                            and len(parsed_expr.children) == 3
+                            and parsed_expr.children[0] == Token("LPAR", "(")
+                            and parsed_expr.children[2] == Token("RPAR", ")")
+                        ):
+                            # Extract the components to create object_elem_key_expression
+                            object_key = Tree(
+                                Token("RULE", "object_elem_key"),
+                                [
+                                    Tree(
+                                        Token("RULE", "object_elem_key_expression"),
+                                        parsed_expr.children,  # Already has ( expr_term )
+                                    )
+                                ],
+                            )
+                        else:
+                            # Not wrapped in parens, use as-is (shouldn't happen often)
+                            object_key = Tree(
+                                Token("RULE", "object_elem_key"),
+                                [parsed_expr],
+                            )
+                    except Exception:
+                        # If parsing fails, treat as a string
+                        object_key = Tree(
+                            Token("RULE", "object_elem_key"),
+                            [
+                                self._build_string_rule(
+                                    self._escape_interpolated_str(k), level
+                                )
+                            ],
+                        )
+                elif k.startswith('"') and k.endswith('"'):
+                    # This is a quoted string (possibly with interpolations)
+                    # Parse it to get the proper string structure
+                    try:
+                        ast = reconstruction_parser().parse(f"value = {k}")
+                        attribute = ast.children[0].children[0]
+                        parsed_expr = attribute.children[2]
+                        # parsed_expr is an expr_term wrapping a string
+                        # Extract the string child for object_elem_key
+                        if (
+                            isinstance(parsed_expr, Tree)
+                            and parsed_expr.data == "expr_term"
+                            and len(parsed_expr.children) > 0
+                            and isinstance(parsed_expr.children[0], Tree)
+                            and parsed_expr.children[0].data == "string"
+                        ):
+                            object_key = Tree(
+                                Token("RULE", "object_elem_key"),
+                                [
+                                    parsed_expr.children[0]
+                                ],  # Just the string, not expr_term
+                            )
+                        else:
+                            # Fallback: use parsed_expr as-is
+                            object_key = Tree(
+                                Token("RULE", "object_elem_key"),
+                                [parsed_expr],
+                            )
+                    except Exception:
+                        # If parsing fails, fall back to building it as a string
+                        # Strip the outer quotes and build the string
+                        inner = k[1:-1]
+                        object_key = Tree(
+                            Token("RULE", "object_elem_key"),
+                            [self._build_string_rule(inner, level)],
+                        )
+                else:
+                    # Use a quoted string for keys with special characters
+                    object_key = Tree(
+                        Token("RULE", "object_elem_key"),
+                        [
+                            self._build_string_rule(
+                                self._escape_interpolated_str(k), level
+                            )
+                        ],
+                    )
+
                 elements.append(
                     Tree(
                         Token("RULE", "object_elem"),
                         [
-                            Tree(
-                                Token("RULE", "object_elem_key"),
-                                [Tree(Token("RULE", "identifier"), [Token("NAME", k)])],
-                            ),
+                            object_key,
                             Token("EQ", " ="),
                             value_expr_term,
                         ],
